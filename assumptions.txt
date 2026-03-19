@@ -1,0 +1,20 @@
+1. Mathematical & Execution Assumptions
+Zero Impact/Infinite Liquidity: The code assumes that if you buy 10,000 RS worth of ETH, there is a seller exactly at Market Price + 0.1%. In reality, large orders eat through the "Order Book," moving the price against you more than 0.1% (this is called Price Impact).
+
+Price Point Accuracy: We assume you execute at the Hourly Close. In a real backtest, you might execute at the Open of the next candle to avoid "Look-ahead bias" (using data you wouldn't have known yet).
+
+Linear Scaling: We assume the 0.1% fee is a flat rate. Some exchanges have "Tiers" where the fee drops to 0.05% if you trade more than $1M a month.
+
+The "Double Tax": The code assumes you pay 0.1% on entry and 0.1% on exit. This is a conservative (and safe) assumption used by professional traders.
+
+2. The "Shorting" Model Assumptions
+1:1 Margin (No Leverage): We assume that to Short 10,000 RS of ETH, you must have 10,000 RS in your account as collateral.
+
+Borrowing is Free: In real Ethereum trading (especially on Aave or Perps), you pay an Interest Rate or Funding Rate to keep a short position open. Our code assumes holding a short for 1 hour costs the same as holding it for 100 hours.
+
+No Liquidations: Since we assume 1:1 margin, the code doesn't check if the price of ETH doubled while you were short (which would bankrupt a real account). It only calculates the loss when the trade is closed.
+
+3. Data & Time Assumptions
+Continuous Trading: We assume the market never "gaps." Crypto trades 24/7, but if your CSV has a missing hour (e.g., a server went down), the code will treat the next available hour as the "next" sequential price, ignoring the time gap.
+
+Single Asset: The engine assumes your balance is in the "Quote" currency (e.g., RS or USDT) and you are only trading one pair (ETH/RS).
