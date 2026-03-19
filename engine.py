@@ -110,7 +110,7 @@ class EthereumTradingEngine:
                 "pnl%", "trade_type"
             ])
 
-        w.writerow([pos['entry_datetime'], pos['entry_price'], pos['exit_datetime'], pos['exit_price'], pnl_pct, pos['trade_type']])
+        w.writerow([pos['entry_datetime'], pos['entry_price'], timestamp, exit_price, pnl_pct, pos['type']])
         f.close()
 
         print(f"[{timestamp}] CLOSE {pos['type'].upper()} | Exit Price: {exit_price:.2f} | PnL%: {pnl_pct:.2f}%")
