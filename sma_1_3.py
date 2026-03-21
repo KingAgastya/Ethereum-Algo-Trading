@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+import os
+from engine import EthereumTradingEngine
+
+def run_backtest(csv_path, initial_funds=100000.0):
+    # 1. Clean up old logs
+    if os.path.exists('logs.csv'):
+        os.remove('logs.csv')
+
+    # 2. Load and Prepare Data
+    if not os.path.exists(csv_path):
+        print(f"Error: {csv_path} not found.")
+        return
+
+    df = pd.read_csv(csv_path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    # 3. Strategy Indicators (SMA 1 and SMA 3)
+    df['sma_1'] = df['close'].rolling(window=1).mean()
+    df['sma_3'] = df['close'].rolling(window=3).mean()
+
+    # 4. Initialize Engine
+    engine = EthereumTradingEngine(initial_balance=initial_funds, fee_rate=0.001)
+
+    print(f"Starting SMA Crossover Backtest (1/3)...")
+
+    # 5. The "No-Bias" Loop
+    for i in range(len(df) - 1):
+        current_row = df.iloc[i]
+        next_row = df.iloc[i + 1]
+
+        if pd.isna(current_row['sma_3']):
+            continue
+
+        target_signal = 1 if current_row['sma_1'] > current_row['sma_3'] else -1
+        current_budget = engine.balance * 0.20
+
+        engine.execute_trade(
+            signal=target_signal,
+            budget=current_budget,
+            market_price=next_row['open'], 
+            timestamp=next_row['timestamp'],
+            gas_fee=0.0 
+        )
+
+    # 6. Close any remaining open position
+    if engine.current_position is not None:
+        last_row = df.iloc[-1]
+        exit_sig = -1 if engine.current_position['type'] == 'long' else 1
+        engine.execute_trade(exit_sig, 0, last_row['close'], last_row['timestamp'], 0.0)
+
+    # --- PERFORMANCE METRICS CALCULATION ---
+    history = engine.get_logs()
+    if history.empty:
+        print("No trades executed.")
+        return
+
+    # A. Reconstructing PnL Value since engine.py only provides PnL%
+    # pnl_val = (final_balance_of_this_trade - final_balance_of_previous_trade)
+    # We use .diff() to find the change in balance per trade
+    history['balance_prev'] = history['final_balance'].shift(1).fillna(initial_funds)
+    history['pnl_val'] = history['final_balance'] - history['balance_prev']
+
+    # B. Basic Stats
+    net_profit = engine.balance - initial_funds
+    total_trades = len(history)
+    wins = history[history['pnl%'] > 0]
+    losses = history[history['pnl%'] <= 0]
+    win_rate = (len(wins) / total_trades) * 100
+
+    # C. USDT/RS Averages
+    avg_win = wins['pnl_val'].mean() if not wins.empty else 0
+    avg_loss = losses['pnl_val'].mean() if not losses.empty else 0
+
+    # D. Time Metrics (Duration & CAGR)
+    history['entry_datetime'] = pd.to_datetime(history['entry_datetime'])
+    history['exit_datetime'] = pd.to_datetime(history['exit_datetime'])
+    avg_duration = (history['exit_datetime'] - history['entry_datetime']).mean()
+
+    # Timeframe calculation
+    days_total = (df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]).days
+    years_elapsed = max(days_total / 365.25, 0.001)
+    cagr = (((engine.balance / initial_funds) ** (1 / years_elapsed)) - 1) * 100
+
+    # E. Drawdown Calculation (Compounded)
+    balance_curve = pd.Series([initial_funds] + history['final_balance'].tolist())
+    peaks = balance_curve.cummax()
+    drawdowns = (balance_curve - peaks) / peaks
+    max_dd = drawdowns.min() * 100
+
+    # F. Risk Ratios (Sharpe/Sortino/Calmar)
+    trade_returns = history['pnl%'] / 100
+    ann_factor = np.sqrt(total_trades / years_elapsed)
+    
+    sharpe = (trade_returns.mean() / trade_returns.std() * ann_factor) if trade_returns.std() != 0 else 0
+    
+    neg_ret = trade_returns[trade_returns < 0]
+    sortino = (trade_returns.mean() / neg_ret.std() * ann_factor) if not neg_ret.empty and neg_ret.std() != 0 else 0
+    
+    calmar = cagr / abs(max_dd) if max_dd != 0 else 0
+
+    # G. Benchmark (ETH & Mock SOL)
+    eth_bh = ((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]) * 100
+    # SOL Benchmark note: To get real SOL data, you'd need a separate CSV.
+    # This prints the current ETH data as the reference.
+    
+    # --- FINAL OUTPUT ---
+    print("\n" + "="*50)
+    print(f"{'FINAL PERFORMANCE REPORT':^50}")
+    print("="*50)
+    print(f"Net Profit:                {net_profit:,.2f} USDT")
+    print(f"Total Closed Trades:       {total_trades}")
+    print(f"Win Rate:                  {win_rate:.2f}%")
+    print(f"Max Drawdown:              {max_dd:.2f}%")
+    print(f"Avg Winning Trade:         {avg_win:,.2f} USDT")
+    print(f"Avg Losing Trade:          {avg_loss:,.2f} USDT")
+    print(f"Avg Holding Duration:      {avg_duration}")
+    print("-" * 50)
+    print(f"CAGR:                      {cagr:.2f}%")
+    print(f"Sharpe Ratio:              {sharpe:.2f}")
+    print(f"Sortino Ratio:             {sortino:.2f}")
+    print(f"Calmar Ratio:              {calmar:.2f}")
+    print("-" * 50)
+    print(f"Buy and Hold (ETH):        {eth_bh:.2f}%")
+    print("="*50)
+
+if __name__ == "__main__":
+    DATA_FILE = 'ETH-USDT_1h.csv' 
+    run_backtest(DATA_FILE)
