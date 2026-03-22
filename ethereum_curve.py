@@ -20,15 +20,15 @@ df = df.sort_values('timestamp')
 
 # === Plot ===
 plt.figure()
-plt.plot(df['timestamp'], df['close'])
+plt.plot(df['timestamp'], df['volume'])
 
-plt.title("Ethereum Closing Price (3 Years)")
+plt.title("Ethereum Volume (3 Years)")
 plt.xlabel("Date")
-plt.ylabel("Close Price")
+plt.ylabel("Volume")
 plt.xticks(rotation=45)
 
 plt.tight_layout()
-output_path = "eth_close_plot.png"  # change name/path if needed
+output_path = "eth_volume_plot.png"  # change name/path if needed
 plt.savefig(output_path, dpi=300, bbox_inches='tight')
 
 print(f"Plot saved to {output_path}")
