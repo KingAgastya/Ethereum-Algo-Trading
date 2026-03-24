@@ -52,7 +52,7 @@ def calculate_adx(df, window=14):
     adx = dx.ewm(alpha=1/window).mean()
     return adx
 
-def run_backtest(csv_path, initial_funds=100000.0):
+def run_backtest(csv_path, initial_funds=50000.0):
     # 1. Clean up old logs
     if os.path.exists('logs.csv'):
         os.remove('logs.csv')
@@ -67,7 +67,8 @@ def run_backtest(csv_path, initial_funds=100000.0):
     df = df.sort_values('timestamp').reset_index(drop=True)
 
     # --- INTEGRATED 2 YEAR LOGIC ---
-    df = df.head(17520).copy()
+    #df = df.head(17520).copy()
+    df = df.tail(8855).copy()
     # -------------------------------
 
     # 4. Initialize Engine
@@ -77,6 +78,7 @@ def run_backtest(csv_path, initial_funds=100000.0):
     # --- STEP 1: PRE-CALCULATE ALL INDICATORS ---
     df['ema_20'] = calculate_ema(df, window=20)
     df['ema_50'] = calculate_ema(df, window=50)
+    df['ema_100'] = calculate_ema(df, window=100)
     df['macd'], df['macd_signal'], _ = calculate_macd(df)
     df['adx'] = calculate_adx(df, window=14)
     df['rsi'] = calculate_rsi(df, window=14)
@@ -89,106 +91,99 @@ def run_backtest(csv_path, initial_funds=100000.0):
     df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['lower_wick'] = df[['open', 'close']].max(axis=1) - df['low']
     df['atr'] = calculate_atr(df, window=14)
-    # --- TRACK WEALTH FOR SHARPE (Requirement #3) ---
+    
+    # --- TRACK WEALTH FOR SHARPE ---
     portfolio_values = []
     volume_trades = 0
     trend_trades = 0
     sideways_trades = 0
     volume_and_trend_trades = 0
     volume_and_sideways_trades = 0
+
     for i in range(len(df) - 1):
-        if i == 0: continue # Need at least one previous row for "closing back in" logic
+        if i < 100: 
+            portfolio_values.append(engine.balance)
+            continue
         
         prev_row = df.iloc[i - 1]
         current_row = df.iloc[i]
         next_row = df.iloc[i + 1]
 
-        if pd.isna(current_row['volume_z']) or pd.isna(current_row['atr']) or pd.isna(current_row['ema_50']) or pd.isna(current_row['adx']) or pd.isna(current_row['bb_up']):
+        if pd.isna(current_row['adx']):
             portfolio_values.append(engine.balance)
             continue
 
         target_signal = 0
-        volume_trade = False
-        trend_trade = False
-        sideways_trade = False
         
-        if current_row['volume_z'] > 2:
-            wick_ratio_1 = current_row['upper_wick'] / current_row['range'] if current_row['range'] != 0 else 0
-            wick_ratio_2 = current_row['lower_wick'] / current_row['range'] if current_row['range'] != 0 else 0
-
-            if current_row['close'] > (current_row['ema_50'] + 1.5 * current_row['atr']) and wick_ratio_1 > 0.5:
-                target_signal = -1
-                volume_trade = True
-            
-            # 2. Long Condition: Volume Spike + Price < EMA50 - Offset + Long Upper Wick
-            elif current_row['close'] < (current_row['ema_50'] - 1.5 * current_row['atr']) and wick_ratio_2 > 0.5:
+        # --- TREND-STRENGTH BASED STRATEGY SWITCH (ADX) ---
+        
+        # 1. STRONG TREND (ADX > 30): MACD + TRIPLE EMA
+        if current_row['adx'] > 30:
+            # LONG: MACD Cross Up + Price > Triple EMAs
+            if (current_row['macd'] > current_row['macd_signal']) and \
+               (current_row['close'] > current_row['ema_20'] > current_row['ema_50'] > current_row['ema_100']):
                 target_signal = 1
-                volume_trade = True
-
-
-
-        # --- TRENDING STRATEGY (ADX > 25) ---
-        if current_row['adx'] > 25:
-            if (current_row['ema_20'] > current_row['ema_50']) and (current_row['close'] > current_row['ema_50']):
-                target_signal = min(1, target_signal+1)
-                trend_trade = True
-            elif (current_row['ema_20'] < current_row['ema_50']) and (current_row['close'] < current_row['ema_50']):
-                target_signal = max(-1, target_signal-1)
-                trend_trade = True
-        
-        # --- MEAN REVERSION STRATEGY (ADX < 20) ---
-        elif current_row['adx'] < 20:
-            # SHORT: RSI > 70 AND (Prev Close > Upper Band) AND (Current Close < Upper Band)
-            if (current_row['rsi'] > 70) and (prev_row['close'] > current_row['bb_up']) and (current_row['close'] < current_row['bb_up']):
-                target_signal = max(-1, target_signal-1)
-                sideways_trade = True
-                
-            # LONG: RSI < 30 AND (Prev Close < Lower Band) AND (Current Close > Lower Band)
-            elif (current_row['rsi'] < 30) and (prev_row['close'] < current_row['bb_low']) and (current_row['close'] > current_row['bb_low']):
-                target_signal = min(1, target_signal+1)
-                sideways_trade = True
-
-            else:
-                # If no clear mean reversion signal, we stay flat or maintain current signal
-                # Here we set to 0 to exit if the range conditions disappear
-                target_signal += 0
-        
-        else:
-            # ADX is between 20 and 25 (No-man's land), stay neutral
-            target_signal += 0
-
-        current_budget = engine.balance * 0.20
-
-        if volume_trade:
-            if sideways_trade:
-                volume_and_sideways_trades += 1
-            elif trend_trade:
-                volume_and_trend_trades += 1
-            else:
-                volume_trades += 1
-        else:
-            if sideways_trade:
-                sideways_trades += 1
-            elif trend_trade:
                 trend_trades += 1
+            # SHORT: MACD Cross Down + Price < Triple EMAs
+            elif (current_row['macd'] < current_row['macd_signal']) and \
+                 (current_row['close'] < current_row['ema_20'] < current_row['ema_50'] < current_row['ema_100']):
+                target_signal = -1
+                trend_trades += 1
+            else:
+                # If trend is strong but signal fades, maintain or exit based on engine
+                if engine.current_position:
+                    target_signal = 1 if engine.current_position['type'] == 'long' else -1
+                else:
+                    target_signal = 0
+
+        # 2. WEAK TREND / RANGING (ADX < 20): RSI + BOLLINGER
+        elif current_row['adx'] < 20:
+            # LONG: RSI Oversold + Price below Lower Band
+            if (current_row['rsi'] < 40) and (current_row['close'] < current_row['bb_low']):
+                target_signal = 1
+                sideways_trades += 1
+            # SHORT: RSI Overbought + Price above Upper Band
+            elif (current_row['rsi'] > 65) and (current_row['close'] > current_row['bb_up']):
+                target_signal = -1
+                sideways_trades += 1
+            else:
+                # Hold current position if in range
+                if engine.current_position:
+                    target_signal = 1 if engine.current_position['type'] == 'long' else -1
+                else:
+                    target_signal = 0
+
+        # 3. TRANSITION ZONE (ADX 20-30): Hold current position
+        else:
+            if engine.current_position:
+                target_signal = 1 if engine.current_position['type'] == 'long' else -1
+            else:
+                target_signal = 0
+
+        # ALL-IN 100% BUDGET
+        current_budget = engine.balance
         
-        engine.execute_trade(
-            signal=target_signal,
-            budget=current_budget,
-            market_price=next_row['open'], 
-            timestamp=next_row['timestamp'],
-            gas_fee=0.0 
-        )
+        if target_signal == 1:
+                engine.execute_trade(
+                signal=target_signal,
+                budget=current_budget,
+                market_price=next_row['open'], 
+                timestamp=next_row['timestamp'],
+                gas_fee=0.0 
+            )
+        elif target_signal == -1:
+            if engine.current_position is not None:
+                pos = engine.current_position
+                if pos['type'] == 'long':
+                    engine._close_position(next_row['open'], next_row['timestamp'], 0)
 
         # Calculate Hourly Portfolio Value (Requirement #3)
         current_val = engine.balance
         if engine.current_position is not None:
             pos = engine.current_position
-            if pos['type'] == 'long':
-                current_val += (pos['volume'] * current_row['close'])
-            else:
-                pnl = (pos['entry_price'] - current_row['close']) * pos['volume']
-                current_val += (pos['budget_allocated'] + pnl)
+            side = 1 if pos['type'] == 'long' else -1
+            unrealized_pnl = (current_row['close'] - pos['entry_price']) * pos['volume'] * side
+            current_val += (pos['budget_allocated'] + unrealized_pnl)
         portfolio_values.append(current_val)
 
     # 6. Close any remaining open position
@@ -207,7 +202,7 @@ def run_backtest(csv_path, initial_funds=100000.0):
     history['balance_prev'] = history['final_balance'].shift(1).fillna(initial_funds)
     history['pnl_val'] = history['final_balance'] - history['balance_prev']
 
-    # --- RATIO CALCULATIONS (BASED ON ASSIGNMENT RULES) ---
+    # --- RATIO CALCULATIONS ---
     pv_series = pd.Series(portfolio_values)
     hourly_returns = pv_series.pct_change().dropna()
     candles_per_year = 24 * 365 
@@ -260,11 +255,8 @@ def run_backtest(csv_path, initial_funds=100000.0):
     print(f"Total Closed Trades:       {total_trades}")
     print(f"Win Rate:                  {win_rate:.2f}%")
     print(f"Max Drawdown:              {max_dd:.2f}%")
-    print(f"Volume Trades:             {volume_trades}")
-    print(f"Volume and Trend Trades:   {volume_and_trend_trades}")
-    print(f"Volume and Sideways Trades:{volume_and_sideways_trades}")
-    print(f"Trend Trades:              {trend_trades}")
-    print(f"Sideways Trades:           {sideways_trades}")
+    print(f"Trend Trades (High ADX):   {trend_trades}")
+    print(f"Sideways Trades (Low ADX): {sideways_trades}")
     print(f"Avg Winning Trade:         {avg_win:,.2f} USDT")
     print(f"Avg Losing Trade:          {avg_loss:,.2f} USDT")
     print(f"Avg Holding Duration:      {avg_duration}")
@@ -277,14 +269,14 @@ def run_backtest(csv_path, initial_funds=100000.0):
     print(f"Buy and Hold (ETH):        {eth_bh:.2f}%")
     print("="*50)
 
-    # 1. Prepare Plot Data (Restored to original format)
+    # 1. Prepare Plot Data
     times = [df['timestamp'].iloc[0]]
     balances = [initial_funds]
     if not history.empty:
         times.extend(pd.to_datetime(history['exit_datetime']).tolist())
         balances.extend(history['final_balance'].tolist())
 
-    # 2. Create Plot (Restored Original Style)
+    # 2. Create Plot
     plt.figure(figsize=(12, 6))
     plt.plot(times, balances, label='Portfolio Value (Equity)', color='#007bff', linewidth=2)
     plt.plot(df['timestamp'], (df['close'] / df['close'].iloc[0]) * initial_funds, label='Buy & Hold ETH', alpha=0.5, linestyle='--')
@@ -302,7 +294,6 @@ def run_backtest(csv_path, initial_funds=100000.0):
 
     plt.tight_layout()
     plt.savefig('equity_curve.png')
-    print("Graph saved as 'equity_curve.png'")
     plt.show()
 
 if __name__ == "__main__":
