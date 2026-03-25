@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
-from engine import EthereumTradingEngine
+from engine_2 import EthereumTradingEngine
 import matplotlib.pyplot as plt
 
 def calculate_ema(df, window=20):
@@ -43,14 +43,65 @@ def calculate_adx(df, window=14):
     minus_dm = df['low'].diff()
     plus_dm[plus_dm < 0] = 0
     minus_dm[minus_dm > 0] = 0
-    
-    tr = calculate_atr(df, window) 
-    
+    tr = calculate_atr(df, window)
     plus_di = 100 * (plus_dm.ewm(alpha=1/window).mean() / tr)
     minus_di = 100 * (abs(minus_dm).ewm(alpha=1/window).mean() / tr)
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
     adx = dx.ewm(alpha=1/window).mean()
     return adx
+
+# ---------------------------------------------------------------------------
+# DYNAMIC POSITION SIZING
+# ---------------------------------------------------------------------------
+# Base allocation fractions by signal type:
+#
+#   trend_long  — ADX>30, bullish triple-EMA stack + MACD aligned
+#                 Highest confidence, aligned with ETH's long-term bias  → 100%
+#
+#   trend_short — ADX>30, bearish triple-EMA stack + MACD aligned
+#                 Valid signal but fights ETH's structural upward drift   →  70%
+#
+#   side_long   — ADX<25, RSI<40 + price below lower Bollinger Band
+#                 Clean mean-reversion with a well-defined entry level    →  80%
+#
+#   side_short  — ADX<25, RSI>65 + price above upper Bollinger Band
+#                 Weakest edge; most prone to false signals in rallies    →  50%
+#
+# ATR volatility scalar:
+#   When the market is choppier than its recent norm (ATR > 20-period ATR mean),
+#   scale down allocation by up to 20% to reduce exposure to noisy conditions.
+#   scalar = clamp(atr_mean / atr_current, 0.80, 1.00)
+#   → calm market  : atr_current ≈ atr_mean  → scalar ≈ 1.00 (no reduction)
+#   → choppy market: atr_current >> atr_mean → scalar → 0.80 (20% reduction)
+# ---------------------------------------------------------------------------
+
+BASE_ALLOC = {
+    'trend_long':  1.00,
+    'trend_short': 0.70,
+    'side_long':   0.80,
+    'side_short':  0.50,
+}
+
+def get_position_size(total_capital, signal_type, atr_current, atr_mean):
+    """
+    Returns the USDT budget to allocate for a new position entry.
+
+    total_capital : available balance (engine.balance when flat)
+    signal_type   : one of 'trend_long', 'trend_short', 'side_long', 'side_short'
+    atr_current   : ATR value at the current candle
+    atr_mean      : rolling 20-period mean of ATR (pre-calculated on df)
+    """
+    base_fraction = BASE_ALLOC[signal_type]
+
+    # Volatility scalar — reduce size in unusually choppy markets
+    if atr_mean and not np.isnan(atr_mean) and atr_mean > 0 and not np.isnan(atr_current):
+        raw_scalar = atr_mean / atr_current        # <1.0 when ATR is above average
+        vol_scalar = float(np.clip(raw_scalar, 0.80, 1.00))
+    else:
+        vol_scalar = 1.0
+
+    return total_capital * base_fraction * vol_scalar
+
 
 def run_backtest(csv_path, initial_funds=50000.0):
     # 1. Clean up old logs
@@ -74,8 +125,7 @@ def run_backtest(csv_path, initial_funds=50000.0):
     # 4. Initialize Engine
     engine = EthereumTradingEngine(initial_balance=initial_funds, fee_rate=0.001)
 
-    # 5. The "No-Bias" Loop
-    # --- STEP 1: PRE-CALCULATE ALL INDICATORS ---
+    # --- PRE-CALCULATE ALL INDICATORS ---
     df['ema_20'] = calculate_ema(df, window=20)
     df['ema_50'] = calculate_ema(df, window=50)
     df['ema_100'] = calculate_ema(df, window=100)
@@ -84,92 +134,122 @@ def run_backtest(csv_path, initial_funds=50000.0):
     df['rsi'] = calculate_rsi(df, window=14)
     df['bb_up'], df['bb_mid'], df['bb_low'] = calculate_bollinger_bands(df, window=20, std_dev=2)
     v_mean = df['volume'].rolling(window=20).mean()
-    v_std = df['volume'].rolling(window=20).std()
-    df['volume_z'] = (df['volume'] - v_mean) / v_std
-    df['range'] = df['high'] - df['low']
-    # Upper Wick = High - Max(Open, Close)
+    v_std  = df['volume'].rolling(window=20).std()
+    df['volume_z']   = (df['volume'] - v_mean) / v_std
+    df['range']      = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['lower_wick'] = df[['open', 'close']].max(axis=1) - df['low']
-    df['atr'] = calculate_atr(df, window=14)
-    
-    # --- TRACK WEALTH FOR SHARPE ---
+    df['atr']        = calculate_atr(df, window=14)
+    df['atr_mean']   = df['atr'].rolling(window=20).mean()   # used by vol scalar
+
+    # --- TRACKING ---
     portfolio_values = []
     volume_trades = 0
-    trend_trades = 0
+    trend_trades  = 0
     sideways_trades = 0
-    volume_and_trend_trades = 0
+    volume_and_trend_trades   = 0
     volume_and_sideways_trades = 0
 
     for i in range(len(df) - 1):
-        if i < 100: 
+        if i < 100:
             portfolio_values.append(engine.balance)
             continue
-        
-        prev_row = df.iloc[i - 1]
+
+        prev_row    = df.iloc[i - 1]
         current_row = df.iloc[i]
-        next_row = df.iloc[i + 1]
+        next_row    = df.iloc[i + 1]
 
         if pd.isna(current_row['adx']):
             portfolio_values.append(engine.balance)
             continue
 
         target_signal = 0
-        
-        # --- TREND-STRENGTH BASED STRATEGY SWITCH (ADX) ---
-        
+        signal_type   = None   # set only on genuine new-entry signals
+
+        # ----------------------------------------------------------------
+        # STRATEGY SWITCH — ADX-gated
+        # ----------------------------------------------------------------
+
         # 1. STRONG TREND (ADX > 30): MACD + TRIPLE EMA
         if current_row['adx'] > 30:
-            # LONG: MACD Cross Up + Price > Triple EMAs
             if (current_row['macd'] > current_row['macd_signal']) and \
                (current_row['close'] > current_row['ema_20'] > current_row['ema_50'] > current_row['ema_100']):
                 target_signal = 1
+                signal_type   = 'trend_long'
                 trend_trades += 1
-            # SHORT: MACD Cross Down + Price < Triple EMAs
             elif (current_row['macd'] < current_row['macd_signal']) and \
                  (current_row['close'] < current_row['ema_20'] < current_row['ema_50'] < current_row['ema_100']):
                 target_signal = -1
+                signal_type   = 'trend_short'
                 trend_trades += 1
             else:
-                # If trend is strong but signal fades, maintain or exit based on engine
+                # Trend strong but indicators not aligned — hold current position
                 if engine.current_position:
                     target_signal = 1 if engine.current_position['type'] == 'long' else -1
                 else:
                     target_signal = 0
 
-        # 2. WEAK TREND / RANGING (ADX < 20): RSI + BOLLINGER
+        # 2. RANGING (ADX < 25): RSI + BOLLINGER
         elif current_row['adx'] < 25:
-            # LONG: RSI Oversold + Price below Lower Band
             if (current_row['rsi'] < 40) and (current_row['close'] < current_row['bb_low']):
                 target_signal = 1
+                signal_type   = 'side_long'
                 sideways_trades += 1
-            # SHORT: RSI Overbought + Price above Upper Band
             elif (current_row['rsi'] > 65) and (current_row['close'] > current_row['bb_up']):
                 target_signal = -1
+                signal_type   = 'side_short'
                 sideways_trades += 1
             else:
-                # Hold current position if in range
                 if engine.current_position:
                     target_signal = 1 if engine.current_position['type'] == 'long' else -1
                 else:
                     target_signal = 0
 
-        # 3. TRANSITION ZONE (ADX 20-30): Hold current position
+        # 3. TRANSITION ZONE (ADX 25-30): hold if in a position, flat otherwise
         else:
             if engine.current_position:
                 target_signal = 1 if engine.current_position['type'] == 'long' else -1
             else:
                 target_signal = 0
 
-        # ALL-IN 100% BUDGET
-        current_budget = engine.balance
-        
+        # ----------------------------------------------------------------
+        # DYNAMIC POSITION SIZING
+        #
+        # Three cases:
+        #   A. Already in a position (hold signal) → reuse budget_allocated exactly.
+        #      engine.balance = 0 when a position is open (collateral locked), so
+        #      we must read capital from the position itself, not the balance.
+        #
+        #   B. New entry (signal_type is set, no open position) → size dynamically
+        #      using get_position_size() based on signal confidence + ATR volatility.
+        #
+        #   C. Flat with no new signal → current_budget irrelevant (no trade fires).
+        # ----------------------------------------------------------------
+        if engine.current_position is not None:
+            # Case A — preserve existing allocation, do not resize mid-trade
+            current_budget = engine.current_position['budget_allocated']
+        elif signal_type is not None:
+            # Case B — fresh entry: apply dynamic sizing
+            current_budget = get_position_size(
+                total_capital=engine.balance,
+                signal_type=signal_type,
+                atr_current=current_row['atr'],
+                atr_mean=current_row['atr_mean']
+            )
+        else:
+            # Case C — no trade will execute; value doesn't matter
+            current_budget = engine.balance
+
+        # ----------------------------------------------------------------
+        # TRADE EXECUTION (unchanged from original)
+        # ----------------------------------------------------------------
         if target_signal == 1:
             engine.execute_trade(
                 signal=target_signal,
                 budget=current_budget,
-                market_price=next_row['open'], 
+                market_price=next_row['open'],
                 timestamp=next_row['timestamp'],
-                gas_fee=0.0 
+                gas_fee=0.0
             )
         elif target_signal == -1:
             if engine.current_position is not None:
@@ -177,10 +257,10 @@ def run_backtest(csv_path, initial_funds=50000.0):
                 if pos['type'] == 'long':
                     engine._close_position(next_row['open'], next_row['timestamp'], 0)
 
-        # Calculate Hourly Portfolio Value (Requirement #3)
+        # Calculate Hourly Portfolio Value
         current_val = engine.balance
         if engine.current_position is not None:
-            pos = engine.current_position
+            pos  = engine.current_position
             side = 1 if pos['type'] == 'long' else -1
             unrealized_pnl = (next_row['open'] - pos['entry_price']) * pos['volume']
             current_val += (pos['budget_allocated'] + unrealized_pnl)
@@ -192,61 +272,52 @@ def run_backtest(csv_path, initial_funds=50000.0):
         exit_sig = -1 if engine.current_position['type'] == 'long' else 1
         engine.execute_trade(exit_sig, 0, last_row['close'], last_row['timestamp'], 0.0)
 
-    # --- PERFORMANCE METRICS CALCULATION ---
+    # --- PERFORMANCE METRICS ---
     history = engine.get_logs()
     if history.empty:
         print("No trades executed.")
         return
 
-    # A. Reconstructing PnL Value
     history['balance_prev'] = history['final_balance'].shift(1).fillna(initial_funds)
-    history['pnl_val'] = history['final_balance'] - history['balance_prev']
+    history['pnl_val']      = history['final_balance'] - history['balance_prev']
 
-    # --- RATIO CALCULATIONS ---
-    pv_series = pd.Series(portfolio_values)
+    pv_series      = pd.Series(portfolio_values)
     hourly_returns = pv_series.pct_change().dropna()
-    candles_per_year = 24 * 365 
-    
+    candles_per_year = 24 * 365
+
     mean_ret = hourly_returns.mean()
-    std_ret = hourly_returns.std()
-    
-    sharpe = (mean_ret * np.sqrt(candles_per_year)) / std_ret if std_ret != 0 else 0
-    
+    std_ret  = hourly_returns.std()
+    sharpe   = (mean_ret * np.sqrt(candles_per_year)) / std_ret if std_ret != 0 else 0
+
     downside_returns = hourly_returns[hourly_returns < 0]
     std_down = downside_returns.std()
-    sortino = (mean_ret * np.sqrt(candles_per_year)) / std_down if std_down != 0 else 0
-    # ------------------------------------------------------
+    sortino  = (mean_ret * np.sqrt(candles_per_year)) / std_down if std_down != 0 else 0
 
-    # B. Basic Stats
-    net_profit = engine.balance - initial_funds
+    net_profit   = engine.balance - initial_funds
     total_trades = len(history)
-    wins = history[history['pnl%'] > 0]
+    wins   = history[history['pnl%'] > 0]
     losses = history[history['pnl%'] <= 0]
     win_rate = (len(wins) / total_trades) * 100
 
-    # C. USDT/RS Averages
-    avg_win = wins['pnl_val'].mean() if not wins.empty else 0
+    avg_win  = wins['pnl_val'].mean()   if not wins.empty   else 0
     avg_loss = losses['pnl_val'].mean() if not losses.empty else 0
 
-    # D. Time Metrics
     history['entry_datetime'] = pd.to_datetime(history['entry_datetime'])
-    history['exit_datetime'] = pd.to_datetime(history['exit_datetime'])
+    history['exit_datetime']  = pd.to_datetime(history['exit_datetime'])
     avg_duration = (history['exit_datetime'] - history['entry_datetime']).mean()
 
-    days_total = (df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]).days
+    days_total    = (df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]).days
     years_elapsed = max(days_total / 365.25, 0.001)
     cagr = (((engine.balance / initial_funds) ** (1 / years_elapsed)) - 1) * 100
 
-    # E. Drawdown Calculation
     balance_curve = pd.Series([initial_funds] + history['final_balance'].tolist())
-    peaks = balance_curve.cummax()
-    drawdowns = (balance_curve - peaks) / peaks
-    max_dd = drawdowns.min() * 100
+    peaks         = balance_curve.cummax()
+    drawdowns     = (balance_curve - peaks) / peaks
+    max_dd        = drawdowns.min() * 100
 
     calmar = cagr / abs(max_dd) if max_dd != 0 else 0
     eth_bh = ((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]) * 100
-    
-    # --- FINAL OUTPUT ---
+
     print("\n" + "="*50)
     print(f"{'FINAL PERFORMANCE REPORT':^50}")
     print("="*50)
@@ -269,33 +340,31 @@ def run_backtest(csv_path, initial_funds=50000.0):
     print(f"Buy and Hold (ETH):        {eth_bh:.2f}%")
     print("="*50)
 
-    # 1. Prepare Plot Data
-    times = [df['timestamp'].iloc[0]]
+    times    = [df['timestamp'].iloc[0]]
     balances = [initial_funds]
     if not history.empty:
         times.extend(pd.to_datetime(history['exit_datetime']).tolist())
         balances.extend(history['final_balance'].tolist())
 
-    # 2. Create Plot
     plt.figure(figsize=(12, 6))
     plt.plot(times, balances, label='Portfolio Value (Equity)', color='#007bff', linewidth=2)
-    plt.plot(df['timestamp'], (df['close'] / df['close'].iloc[0]) * initial_funds, label='Buy & Hold ETH', alpha=0.5, linestyle='--')
-    
+    plt.plot(df['timestamp'], (df['close'] / df['close'].iloc[0]) * initial_funds,
+             label='Buy & Hold ETH', alpha=0.5, linestyle='--')
     plt.title('Ethereum Algorithmic Trading: Portfolio Value Over Time (2 Year Backtest)', fontsize=14)
     plt.xlabel('Date', fontsize=12)
     plt.ylabel('Balance (USDT/RS)', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
-    
-    plt.fill_between(times, balances, initial_funds, where=(pd.Series(balances) >= initial_funds), 
+    plt.fill_between(times, balances, initial_funds,
+                     where=(pd.Series(balances) >= initial_funds),
                      interpolate=True, color='green', alpha=0.1)
-    plt.fill_between(times, balances, initial_funds, where=(pd.Series(balances) < initial_funds), 
+    plt.fill_between(times, balances, initial_funds,
+                     where=(pd.Series(balances) < initial_funds),
                      interpolate=True, color='red', alpha=0.1)
-
     plt.tight_layout()
     plt.savefig('equity_curve.png')
     plt.show()
 
 if __name__ == "__main__":
-    DATA_FILE = 'ETH-USDT_1h.csv' 
+    DATA_FILE = 'ETH-USDT_1h.csv'
     run_backtest(DATA_FILE)

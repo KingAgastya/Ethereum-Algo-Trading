@@ -68,7 +68,7 @@ def run_backtest(csv_path, initial_funds=50000.0):
 
     # --- INTEGRATED 2 YEAR LOGIC ---
     #df = df.head(17520).copy()
-    #df = df.tail(8855).copy()
+    df = df.tail(8855).copy()
     # -------------------------------
 
     # 4. Initialize Engine
@@ -87,18 +87,15 @@ def run_backtest(csv_path, initial_funds=50000.0):
     v_std = df['volume'].rolling(window=20).std()
     df['volume_z'] = (df['volume'] - v_mean) / v_std
     df['range'] = df['high'] - df['low']
-    # Upper Wick = High - Max(Open, Close)
     df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
     df['lower_wick'] = df[['open', 'close']].max(axis=1) - df['low']
     df['atr'] = calculate_atr(df, window=14)
     
     # --- TRACK WEALTH FOR SHARPE ---
     portfolio_values = []
-    volume_trades = 0
     trend_trades = 0
     sideways_trades = 0
-    volume_and_trend_trades = 0
-    volume_and_sideways_trades = 0
+    prev_target_signal = 0  # For signal confirmation filter (improvement #3)
 
     for i in range(len(df) - 1):
         if i < 100: 
@@ -113,77 +110,124 @@ def run_backtest(csv_path, initial_funds=50000.0):
             portfolio_values.append(engine.balance)
             continue
 
-        target_signal = 0
-        
+        raw_signal = 0
+        is_sideways_signal = False
+
         # --- TREND-STRENGTH BASED STRATEGY SWITCH (ADX) ---
-        
+
         # 1. STRONG TREND (ADX > 30): MACD + TRIPLE EMA
         if current_row['adx'] > 30:
-            # LONG: MACD Cross Up + Price > Triple EMAs
             if (current_row['macd'] > current_row['macd_signal']) and \
                (current_row['close'] > current_row['ema_20'] > current_row['ema_50'] > current_row['ema_100']):
-                target_signal = 1
+                raw_signal = 1
                 trend_trades += 1
-            # SHORT: MACD Cross Down + Price < Triple EMAs
             elif (current_row['macd'] < current_row['macd_signal']) and \
                  (current_row['close'] < current_row['ema_20'] < current_row['ema_50'] < current_row['ema_100']):
-                target_signal = -1
+                raw_signal = -1
                 trend_trades += 1
             else:
-                # If trend is strong but signal fades, maintain or exit based on engine
                 if engine.current_position:
-                    target_signal = 1 if engine.current_position['type'] == 'long' else -1
+                    raw_signal = 1 if engine.current_position['type'] == 'long' else -1
                 else:
-                    target_signal = 0
+                    raw_signal = 0
 
-        # 2. WEAK TREND / RANGING (ADX < 20): RSI + BOLLINGER
+        # 2. WEAK TREND / RANGING (ADX < 25): RSI + BOLLINGER — LONG-BIASED
         elif current_row['adx'] < 25:
-            # LONG: RSI Oversold + Price below Lower Band
             if (current_row['rsi'] < 40) and (current_row['close'] < current_row['bb_low']):
-                target_signal = 1
+                raw_signal = 1
+                is_sideways_signal = True
                 sideways_trades += 1
-            # SHORT: RSI Overbought + Price above Upper Band
-            elif (current_row['rsi'] > 65) and (current_row['close'] > current_row['bb_up']):
-                target_signal = -1
+            elif (current_row['rsi'] >= 75) and \
+                 (current_row['close'] > current_row['bb_up']) and \
+                 (current_row['close'] < current_row['ema_50']):
+                raw_signal = -1
+                is_sideways_signal = True
                 sideways_trades += 1
             else:
-                # Hold current position if in range
                 if engine.current_position:
-                    target_signal = 1 if engine.current_position['type'] == 'long' else -1
+                    raw_signal = 1 if engine.current_position['type'] == 'long' else -1
                 else:
-                    target_signal = 0
+                    raw_signal = 0
 
-        # 3. TRANSITION ZONE (ADX 20-30): Hold current position
+        # 3. TRANSITION ZONE (ADX 25-30): Hold current position, stay flat if none.
+        #    ADX is noisy and oscillates constantly through this band — aggressively
+        #    flattening here causes excessive exits, re-entry fees, and missed moves.
         else:
             if engine.current_position:
-                target_signal = 1 if engine.current_position['type'] == 'long' else -1
+                raw_signal = 1 if engine.current_position['type'] == 'long' else -1
             else:
-                target_signal = 0
+                raw_signal = 0
+
+        # --- SIGNAL CONFIRMATION FILTER ---
+        # Only applied to NEW trend direction entries (flat->new or long->short flip).
+        # Sideways RSI+BB signals are reversal spikes — price bounces within one candle
+        # so requiring confirmation would suppress them entirely. They fire immediately.
+        # Hold signals (same direction as open position) also skip confirmation.
+        if engine.current_position is not None:
+            current_pos_signal = 1 if engine.current_position['type'] == 'long' else -1
+            is_hold = (raw_signal == current_pos_signal)
+        else:
+            current_pos_signal = 0
+            is_hold = False
+
+        is_direction_change = (raw_signal != 0) and (raw_signal != current_pos_signal)
+
+        if is_hold:
+            target_signal = raw_signal
+        elif is_sideways_signal:
+            # Reversal spikes: act immediately, no confirmation
+            target_signal = raw_signal
+        elif is_direction_change and raw_signal == prev_target_signal:
+            # Trend direction change confirmed on two consecutive candles
+            target_signal = raw_signal
+        elif is_direction_change:
+            # First candle of a direction change — wait for confirmation
+            target_signal = current_pos_signal if engine.current_position else 0
+        else:
+            target_signal = raw_signal
+
+        prev_target_signal = raw_signal
 
         # ALL-IN 100% BUDGET
-        current_budget = engine.balance
-        
-        if target_signal == 1:
+        # When a position is open, engine.balance is 0 (collateral is locked).
+        # Use budget_allocated so that hold signals re-use the original capital,
+        # and execute_trade closes + reopens correctly without a budget=0 bug.
+        if engine.current_position is not None:
+            current_budget = engine.current_position['budget_allocated']
+        else:
+            current_budget = engine.balance
+
+        # Execute signal (long, short, or stay flat)
+        if target_signal != 0:
             engine.execute_trade(
                 signal=target_signal,
                 budget=current_budget,
-                market_price=next_row['open'], 
+                market_price=next_row['open'],
                 timestamp=next_row['timestamp'],
-                gas_fee=0.0 
+                gas_fee=0.0
             )
-        elif target_signal == -1:
+        else:
+            # target_signal=0 means go flat: close position if open, else do nothing.
+            # Use _close_position directly — NOT execute_trade(budget=0) — to avoid
+            # the ghost-position / NaN pnl% bug.
             if engine.current_position is not None:
-                pos = engine.current_position
-                if pos['type'] == 'long':
-                    engine._close_position(next_row['open'], next_row['timestamp'], 0)
+                engine._close_position(
+                    market_price=next_row['open'],
+                    timestamp=next_row['timestamp'],
+                    gas_fee=0.0
+                )
 
-        # Calculate Hourly Portfolio Value (Requirement #3)
+        # Calculate Hourly Portfolio Value
         current_val = engine.balance
         if engine.current_position is not None:
             pos = engine.current_position
-            side = 1 if pos['type'] == 'long' else -1
-            unrealized_pnl = (next_row['open'] - pos['entry_price']) * pos['volume']
-            current_val += (pos['budget_allocated'] + unrealized_pnl)
+            if pos['type'] == 'long':
+                unrealized_pnl = (next_row['open'] - pos['entry_price']) * pos['volume']
+                current_val += (pos['budget_allocated'] + unrealized_pnl)
+            else:
+                # For short: unrealized PnL = (entry - current) * volume
+                unrealized_pnl = (pos['entry_price'] - next_row['open']) * pos['volume']
+                current_val += (pos['budget_allocated'] + unrealized_pnl)
         portfolio_values.append(current_val)
 
     # 6. Close any remaining open position
@@ -215,7 +259,6 @@ def run_backtest(csv_path, initial_funds=50000.0):
     downside_returns = hourly_returns[hourly_returns < 0]
     std_down = downside_returns.std()
     sortino = (mean_ret * np.sqrt(candles_per_year)) / std_down if std_down != 0 else 0
-    # ------------------------------------------------------
 
     # B. Basic Stats
     net_profit = engine.balance - initial_funds
