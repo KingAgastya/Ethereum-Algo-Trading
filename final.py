@@ -273,7 +273,93 @@ def run_backtest(csv_path, initial_funds=50000.0):
     plt.tight_layout()
     plt.savefig('equity_curve.png')
     plt.show()
+    
+        # =========================
+    # DRAWDOWN CURVE (WITH BUY & HOLD)
+    # =========================
 
+    # Strategy equity
+    equity_curve = pd.Series(balances, index=pd.to_datetime(times))
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max
+
+    # Buy & Hold equity
+    bh_equity = (df['close'] / df['close'].iloc[0]) * initial_funds
+    bh_equity.index = pd.to_datetime(df['timestamp'])
+    bh_running_max = bh_equity.cummax()
+    bh_drawdown = (bh_equity - bh_running_max) / bh_running_max
+
+    plt.figure(figsize=(12, 5))
+
+    plt.plot(drawdown.index, drawdown.values, label='Strategy Drawdown', linewidth=2)
+    plt.plot(bh_drawdown.index, bh_drawdown.values, linestyle='--', label='Buy & Hold Drawdown')
+
+    plt.title('Drawdown Comparison: Strategy vs Buy & Hold', fontsize=14)
+    plt.xlabel('Date')
+    plt.ylabel('Drawdown')
+
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+
+    plt.fill_between(
+        drawdown.index,
+        drawdown.values,
+        0,
+        where=(drawdown.values < 0),
+        interpolate=True,
+        alpha=0.15
+    )
+
+    plt.tight_layout()
+    plt.savefig('drawdown_comparison.png')
+    plt.show()
+
+        # =========================
+    # BUY / SELL SIGNAL PLOT
+    # =========================
+
+    # Ensure datetime
+    history['entry_datetime'] = pd.to_datetime(history['entry_datetime'])
+    history['exit_datetime'] = pd.to_datetime(history['exit_datetime'])
+
+    # Price series
+    price = df.set_index('timestamp')['close']
+
+    plt.figure(figsize=(14, 6))
+
+    # Plot price
+    plt.plot(price.index, price.values, label='ETH Price', linewidth=1.5)
+
+    # Plot BUY signals (entries)
+    plt.scatter(
+        history['entry_datetime'],
+        df.set_index('timestamp').loc[history['entry_datetime'], 'close'],
+        marker='^',
+        s=80,
+        color = 'green',
+        label='Buy Signal'
+    )
+
+    # Plot SELL signals (exits)
+    plt.scatter(
+        history['exit_datetime'],
+        df.set_index('timestamp').loc[history['exit_datetime'], 'close'],
+        marker='v',
+        s=80,
+        color = 'red',
+        label='Sell Signal'
+    )
+
+    plt.title('Buy and Sell Signals on Price Curve', fontsize=14)
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig('signals_plot.png')
+    plt.show()
 
 if __name__ == "__main__":
     run_backtest('ETH-USDT_1h.csv')
