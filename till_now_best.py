@@ -68,7 +68,7 @@ def run_backtest(csv_path, initial_funds=50000.0):
 
     # --- INTEGRATED 2 YEAR LOGIC ---
     #df = df.head(17520).copy()
-    #df = df.tail(8855).copy()
+    df = df.tail(8855).copy()
     # -------------------------------
 
     # 4. Initialize Engine
@@ -182,7 +182,7 @@ def run_backtest(csv_path, initial_funds=50000.0):
         if engine.current_position is not None:
             pos = engine.current_position
             side = 1 if pos['type'] == 'long' else -1
-            unrealized_pnl = (current_row['close'] - pos['entry_price']) * pos['volume'] * side
+            unrealized_pnl = (next_row['open'] - pos['entry_price']) * pos['volume']
             current_val += (pos['budget_allocated'] + unrealized_pnl)
         portfolio_values.append(current_val)
 
